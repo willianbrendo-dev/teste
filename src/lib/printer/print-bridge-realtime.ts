@@ -171,45 +171,39 @@ export class PrintBridgeRealtime {
         "broadcast",
         { event: "print_job" },
         async (payload) => {
-          console.log("[PrintBridge] ===== BROADCAST RECEBIDO =====");
+          // --- CÓDIGO DE DEBUG RADICAL ---
+          console.log("🚨 [DEBUG] OPA! Chegou algo no Broadcast!");
           
-          // O payload vem em payload.payload quando enviado via broadcast
           const rawJob = payload.payload || payload;
           
-          // --- CORREÇÃO CIRÚRGICA AQUI ---
-          // Tenta encontrar os dados em qualquer variação de nome possível
+          // Debug: Mostra no console QUAIS propriedades chegaram
+          console.log("🚨 [DEBUG] Propriedades recebidas:", Object.keys(rawJob));
+
+          // Tenta pegar o Base64 de qualquer jeito
           const escposData = rawJob.escposDataBase64 || rawJob.escpos_data_base64 || rawJob.escposBase64;
-          const targetDeviceId = rawJob.deviceId || rawJob.device_id;
+          
+          // Tenta pegar os IDs de qualquer jeito
           const targetJobId = rawJob.jobId || rawJob.job_id || rawJob.id;
           const targetOsId = rawJob.osId || rawJob.os_id;
-          // -------------------------------
 
-          console.log("[PrintBridge] Job extraído:", {
-            jobId: targetJobId,
-            deviceId: targetDeviceId,
-            hasData: !!escposData,
-            dataLength: escposData?.length || 0
-          });
-          
-          // Verifica se temos os dados essenciais
           if (!escposData) {
-            console.error("[PrintBridge] ❌ Job ignorado: Dados ESC/POS vazios ou nome da variável incorreto.");
+            console.error("❌ [ERRO] O envelope chegou vazio (sem Base64)!");
+            // Vamos tentar mostrar um alerta na tela do celular pra você saber que falhou aqui
+            alert("ERRO: Recebi o pedido, mas veio sem dados de impressão!");
             return;
           }
 
-          // Verifica se o job é para este dispositivo
-          if (!targetDeviceId || targetDeviceId === this.deviceId) {
-            console.log("[PrintBridge] ✅ Job aceito! Processando...");
-            await this.handlePrintJob({
+          console.log("✅ [DEBUG] Dados encontrados! Tamanho:", escposData.length);
+          console.log("🚀 [DEBUG] Ignorando verificação de Device ID e forçando impressão...");
+
+          // CHAMADA DIRETA SEM VERIFICAÇÃO DE ID
+          await this.handlePrintJob({
               jobId: targetJobId,
               action: "print",
-              escposDataBase64: escposData, // Agora garantimos que tem dados
+              escposDataBase64: escposData,
               documentType: rawJob.documentType || "service_order",
               metadata: rawJob.metadata || { ordemId: targetOsId }
-            });
-          } else {
-            console.log("[PrintBridge] ❌ Job ignorado - destinado para outro device:", targetDeviceId);
-          }
+          });
         }
       );
 
