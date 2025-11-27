@@ -172,33 +172,43 @@ export class PrintBridgeRealtime {
         { event: "print_job" },
         async (payload) => {
           console.log("[PrintBridge] ===== BROADCAST RECEBIDO =====");
-          console.log("[PrintBridge] Timestamp:", new Date().toISOString());
-          console.log("[PrintBridge] Device ID atual:", this.deviceId);
-          console.log("[PrintBridge] Payload completo:", JSON.stringify(payload, null, 2));
           
           // O payload vem em payload.payload quando enviado via broadcast
-          const job = payload.payload || payload;
+          const rawJob = payload.payload || payload;
           
+          // --- CORREÇÃO CIRÚRGICA AQUI ---
+          // Tenta encontrar os dados em qualquer variação de nome possível
+          const escposData = rawJob.escposDataBase64 || rawJob.escpos_data_base64 || rawJob.escposBase64;
+          const targetDeviceId = rawJob.deviceId || rawJob.device_id;
+          const targetJobId = rawJob.jobId || rawJob.job_id || rawJob.id;
+          const targetOsId = rawJob.osId || rawJob.os_id;
+          // -------------------------------
+
           console.log("[PrintBridge] Job extraído:", {
-            jobId: job.jobId?.slice(0, 8) + "...",
-            osId: job.osId,
-            deviceId: job.deviceId,
-            hasData: !!job.escposDataBase64,
-            dataLength: job.escposDataBase64?.length || 0
+            jobId: targetJobId,
+            deviceId: targetDeviceId,
+            hasData: !!escposData,
+            dataLength: escposData?.length || 0
           });
           
+          // Verifica se temos os dados essenciais
+          if (!escposData) {
+            console.error("[PrintBridge] ❌ Job ignorado: Dados ESC/POS vazios ou nome da variável incorreto.");
+            return;
+          }
+
           // Verifica se o job é para este dispositivo
-          if (!job.deviceId || job.deviceId === this.deviceId) {
+          if (!targetDeviceId || targetDeviceId === this.deviceId) {
             console.log("[PrintBridge] ✅ Job aceito! Processando...");
             await this.handlePrintJob({
-              jobId: job.jobId,
+              jobId: targetJobId,
               action: "print",
-              escposDataBase64: job.escposDataBase64,
-              documentType: job.documentType,
-              metadata: job.metadata
+              escposDataBase64: escposData, // Agora garantimos que tem dados
+              documentType: rawJob.documentType || "service_order",
+              metadata: rawJob.metadata || { ordemId: targetOsId }
             });
           } else {
-            console.log("[PrintBridge] ❌ Job ignorado - destinado para outro device:", job.deviceId);
+            console.log("[PrintBridge] ❌ Job ignorado - destinado para outro device:", targetDeviceId);
           }
         }
       );
