@@ -134,16 +134,8 @@ export class PrintBridgeRealtime {
           });
           
           console.log("[PrintBridge] ✅ Presença registrada permanentemente");
-          console.log("[PrintBridge] Track result:", trackResult);
-          console.log("[PrintBridge] Device ID registrado:", this.deviceId);
           
           localStorage.setItem("print_bridge_last_online", new Date().toISOString());
-          
-          // Verifica presença após registro
-          setTimeout(() => {
-            const state = this.presenceChannel?.presenceState();
-            console.log("[PrintBridge] Estado de presença após registro:", state);
-          }, 1000);
           
           // Inicia heartbeat para manter presença ativa
           this.startHeartbeat();
@@ -152,58 +144,46 @@ export class PrintBridgeRealtime {
           this.startQueueCheck();
         } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
           console.error("[PrintBridge] ⚠️ Erro no canal de presença:", status);
-          // Só reconecta se keepAlive estiver ativo
           if (this.keepAlive) {
             await this.handleReconnect();
           }
         }
       });
 
-      // Canal para receber jobs com configurações otimizadas
+      // =================================================================
+      // CANAL DE JOBS (HÍBRIDO: BROADCAST + BANCO DE DADOS)
+      // =================================================================
       this.channel = supabase.channel("print_bridge_jobs", {
         config: {
           broadcast: { ack: true, self: false },
         },
       });
 
-      // Escuta comandos de impressão
+      // 1. ESCUTA VIA BROADCAST (Rápido)
       this.channel.on(
         "broadcast",
         { event: "print_job" },
         async (payload) => {
-          // --- CÓDIGO DE DEBUG RADICAL ---
-          console.log("🚨 [DEBUG] OPA! Chegou algo no Broadcast!");
-          
+          console.log("⚡ [PrintBridge] Recebido via BROADCAST");
           const rawJob = payload.payload || payload;
-          
-          // Debug: Mostra no console QUAIS propriedades chegaram
-          console.log("🚨 [DEBUG] Propriedades recebidas:", Object.keys(rawJob));
+          await this.processIncomingPayload(rawJob);
+        }
+      );
 
-          // Tenta pegar o Base64 de qualquer jeito
-          const escposData = rawJob.escposDataBase64 || rawJob.escpos_data_base64 || rawJob.escposBase64;
-          
-          // Tenta pegar os IDs de qualquer jeito
-          const targetJobId = rawJob.jobId || rawJob.job_id || rawJob.id;
-          const targetOsId = rawJob.osId || rawJob.os_id;
-
-          if (!escposData) {
-            console.error("❌ [ERRO] O envelope chegou vazio (sem Base64)!");
-            // Vamos tentar mostrar um alerta na tela do celular pra você saber que falhou aqui
-            alert("ERRO: Recebi o pedido, mas veio sem dados de impressão!");
-            return;
-          }
-
-          console.log("✅ [DEBUG] Dados encontrados! Tamanho:", escposData.length);
-          console.log("🚀 [DEBUG] Ignorando verificação de Device ID e forçando impressão...");
-
-          // CHAMADA DIRETA SEM VERIFICAÇÃO DE ID
-          await this.handlePrintJob({
-              jobId: targetJobId,
-              action: "print",
-              escposDataBase64: escposData,
-              documentType: rawJob.documentType || "service_order",
-              metadata: rawJob.metadata || { ordemId: targetOsId }
-          });
+      // 2. ESCUTA VIA BANCO DE DADOS (Tanque de Guerra - Seguro)
+      // Se a timeline atualiza, ISSO AQUI VAI DISPARAR A IMPRESSÃO!
+      this.channel.on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "print_jobs",
+          filter: `device_id=eq.${this.deviceId}`, // Filtra só o que for pra mim
+        },
+        async (payload) => {
+          console.log("💾 [PrintBridge] Recebido via BANCO DE DADOS (Insert)");
+          console.log("Dados do banco:", payload.new);
+          await this.processIncomingPayload(payload.new);
         }
       );
 
@@ -220,12 +200,10 @@ export class PrintBridgeRealtime {
           console.log("[PrintBridge] ✅ Conectado permanentemente - Pronto para jobs!");
           
           // Processa fila existente imediatamente após conectar
-          console.log("[PrintBridge] 🔍 Verificando fila de jobs pendentes...");
           await this.processQueuedJobs();
         } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
           this.isConnected = false;
           this.onStatusChange?.("disconnected");
-          // Só reconecta se keepAlive estiver ativo
           if (this.keepAlive) {
             await this.handleReconnect();
           }
@@ -241,17 +219,58 @@ export class PrintBridgeRealtime {
       return false;
     }
   }
+
+  /**
+   * FUNÇÃO UNIFICADA PARA PROCESSAR PACOTES (Broadcast ou DB)
+   * Resolve o problema de nomes diferentes (Snake Case vs Camel Case)
+   */
+  private async processIncomingPayload(rawJob: any): Promise<void> {
+    try {
+      // Normalização de nomes (A mágica que conserta o erro)
+      const escposData = rawJob.escposDataBase64 || rawJob.escpos_data_base64 || rawJob.escposBase64;
+      const targetJobId = rawJob.jobId || rawJob.job_id || rawJob.id;
+      const targetOsId = rawJob.osId || rawJob.os_id;
+      const targetDeviceId = rawJob.deviceId || rawJob.device_id;
+      
+      // Se veio do banco, o status pode ser 'pending'. Se já estiver completed/processing, ignora
+      if (rawJob.status && rawJob.status !== 'pending') {
+        return;
+      }
+
+      // Verificação de segurança básica
+      if (!escposData) {
+        console.error("[PrintBridge] ❌ DADOS VAZIOS! O Base64 não chegou no pacote.");
+        return;
+      }
+
+      // Verificação de ID (Se for diferente, ignora. Se for nulo ou igual, aceita)
+      if (targetDeviceId && targetDeviceId !== this.deviceId) {
+         console.log(`[PrintBridge] Ignorando job para outro device: ${targetDeviceId}`);
+         return;
+      }
+
+      console.log(`[PrintBridge] 🚀 Processando Job ID: ${targetJobId}`);
+      console.log(`[PrintBridge] Tamanho dos dados: ${escposData.length}`);
+
+      await this.handlePrintJob({
+        jobId: targetJobId,
+        action: "print",
+        escposDataBase64: escposData,
+        documentType: rawJob.documentType || "service_order",
+        metadata: rawJob.metadata || { ordemId: targetOsId }
+      });
+    } catch (e) {
+      console.error("[PrintBridge] Erro ao processar payload recebido:", e);
+    }
+  }
   
   /**
    * Inicia heartbeat para manter conexão ativa
    */
   private startHeartbeat(): void {
-    // Limpa heartbeat anterior
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
     }
-    
-    // Envia heartbeat a cada 30 segundos
     this.heartbeatInterval = setInterval(async () => {
       if (this.presenceChannel && this.isConnected) {
         try {
@@ -262,7 +281,6 @@ export class PrintBridgeRealtime {
             online: true,
             version: "2.0"
           });
-          console.log("[PrintBridge] Heartbeat enviado");
         } catch (error) {
           console.error("[PrintBridge] Erro no heartbeat:", error);
         }
@@ -270,9 +288,6 @@ export class PrintBridgeRealtime {
     }, 30000);
   }
   
-  /**
-   * Para o heartbeat
-   */
   private stopHeartbeat(): void {
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
@@ -280,27 +295,17 @@ export class PrintBridgeRealtime {
     }
   }
   
-  /**
-   * Inicia verificação periódica da fila
-   */
   private startQueueCheck(): void {
-    // Limpa verificação anterior
     if (this.queueCheckInterval) {
       clearInterval(this.queueCheckInterval);
     }
-    
-    // Verifica fila a cada 10 segundos
     this.queueCheckInterval = setInterval(async () => {
       if (this.isConnected && !this.isProcessing) {
-        console.log("[PrintBridge] 🔍 Verificação periódica da fila...");
         await this.processQueuedJobs();
       }
     }, 10000);
   }
   
-  /**
-   * Para verificação da fila
-   */
   private stopQueueCheck(): void {
     if (this.queueCheckInterval) {
       clearInterval(this.queueCheckInterval);
@@ -308,83 +313,40 @@ export class PrintBridgeRealtime {
     }
   }
   
-  /**
-   * Processa jobs pendentes na fila do banco de dados
-   */
   private async processQueuedJobs(): Promise<void> {
-    if (this.isProcessing) {
-      console.log("[PrintBridge] Já está processando, ignorando verificação de fila");
-      return;
-    }
+    if (this.isProcessing) return;
 
     try {
-      console.log("[PrintBridge] Consultando fila para device:", this.deviceId);
-      
       // Busca próximo job pendente para este dispositivo
       const { data, error } = await supabase.rpc("get_next_pending_job", {
         p_device_id: this.deviceId
       });
 
-      if (error) {
-        console.error("[PrintBridge] Erro ao buscar job da fila:", error);
-        return;
-      }
+      if (error || !data || (Array.isArray(data) && data.length === 0)) return;
 
-      if (!data || data.length === 0) {
-        console.log("[PrintBridge] ✓ Nenhum job pendente na fila");
-        return;
-      }
-
-      // A função RPC retorna array, pega o primeiro
       const jobs = Array.isArray(data) ? data : [data];
-      if (jobs.length === 0) {
-        console.log("[PrintBridge] ✓ Nenhum job pendente na fila");
-        return;
-      }
-
       const job = jobs[0];
-      console.log("[PrintBridge] 📋 Job encontrado na fila:", {
-        jobId: job.job_id.slice(0, 8) + "...",
-        osId: job.os_id,
-        attempt: job.attempts + 1
-      });
 
-      // Processa o job
-      await this.handlePrintJob({
-        jobId: job.job_id,
-        action: "print",
-        escposDataBase64: job.escpos_data_base64,
-        documentType: "service_order",
-        metadata: {
-          ordemId: job.os_id
-        }
-      });
+      console.log("[PrintBridge] 📋 Job encontrado na fila (polling):", job.job_id);
+
+      await this.processIncomingPayload(job);
 
     } catch (error) {
       console.error("[PrintBridge] Erro ao processar fila:", error);
     }
   }
 
-  /**
-   * Desconecta do canal e marca dispositivo como offline
-   */
   async disconnect(): Promise<void> {
-    console.log("[PrintBridge] 🔌 Desconectando (logout manual)...");
-    
-    // Desativa keep-alive para não reconectar
+    console.log("[PrintBridge] 🔌 Desconectando...");
     this.keepAlive = false;
-    
-    // Para heartbeat e queue check
     this.stopHeartbeat();
     this.stopQueueCheck();
     
-    // Limpa timeouts de reconexão
     if (this.reconnectTimeout) {
       clearTimeout(this.reconnectTimeout);
       this.reconnectTimeout = null;
     }
     
-    // Remove canais
     if (this.presenceChannel) {
       await supabase.removeChannel(this.presenceChannel);
       this.presenceChannel = null;
@@ -399,381 +361,142 @@ export class PrintBridgeRealtime {
     this.isReconnecting = false;
     this.reconnectAttempts = 0;
     this.onStatusChange?.("disconnected");
-    
-    console.log("[PrintBridge] ✅ Desconectado");
   }
 
-  /**
-   * Adiciona job à fila e processa
-   */
   private async handlePrintJob(job: PrintJob): Promise<void> {
-    console.log("[PrintBridge] Job recebido:", job.jobId);
-    
-    // Notifica callback se existir
     this.onJobReceived?.(job);
-
-    // Adiciona à fila
     this.jobQueue.push(job);
-    
-    // Se não está processando, inicia processamento
     if (!this.isProcessing) {
       await this.processQueue();
     }
   }
 
-  /**
-   * Processa fila de jobs sequencialmente
-   */
   private async processQueue(): Promise<void> {
-    if (this.isProcessing || this.jobQueue.length === 0) {
-      return;
-    }
+    if (this.isProcessing || this.jobQueue.length === 0) return;
 
     this.isProcessing = true;
-
     while (this.jobQueue.length > 0) {
       const job = this.jobQueue.shift()!;
       await this.processJob(job);
     }
-
     this.isProcessing = false;
-    
-    // Após processar fila de broadcast, verifica se há jobs pendentes no banco
-    console.log("[PrintBridge] 🔍 Fila de broadcast vazia, verificando banco...");
     await this.processQueuedJobs();
   }
 
-  /**
-   * Processa um único job com retry automático
-   */
   private async processJob(job: PrintJob): Promise<void> {
     const maxAttempts = 3;
     let attempt = 0;
     let lastError: string | undefined;
 
-    // Atualiza status para processing
     await this.updateJobStatus(job.jobId, "processing");
     this.onJobStatusChange?.(job.jobId, "processing");
 
-    console.log(`[PrintBridge] ===== INICIANDO PROCESSAMENTO DE JOB =====`);
-    console.log(`[PrintBridge] Job ID: ${job.jobId}`);
-    console.log(`[PrintBridge] Tipo: ${job.documentType || 'custom'}`);
-    console.log(`[PrintBridge] Modo: ${this.isNativeMode ? 'OTG Android' : 'WebUSB/Wi-Fi'}`);
-
     while (attempt < maxAttempts) {
       attempt++;
-      console.log(`[PrintBridge] Tentativa ${attempt}/${maxAttempts} para job ${job.jobId}`);
-
       try {
-        // Decodifica base64 para Uint8Array
         const binaryString = atob(job.escposDataBase64);
         const bytes = new Uint8Array(binaryString.length);
         for (let i = 0; i < binaryString.length; i++) {
           bytes[i] = binaryString.charCodeAt(i);
         }
 
-        console.log(`[PrintBridge] Buffer decodificado: ${bytes.length} bytes`);
-        console.log(`[PrintBridge] Primeiros bytes:`, Array.from(bytes.slice(0, 20)).map(b => `0x${b.toString(16).padStart(2, '0')}`).join(' '));
-
-        // Envia para impressora
         let success = false;
-        let connectionType = '';
-
+        
         if (this.printMethod === "bematech") {
-          console.log('[PrintBridge] 🖨️ Enviando para Bematech User App...');
-          connectionType = 'Bematech User App';
-          
           const result = await bematechUserClient.print(bytes);
           success = result.success;
-          
-          if (!success) {
-            throw new Error(result.error || "Falha ao enviar para Bematech User");
-          }
-          console.log('[PrintBridge] ✅ Dados enviados com sucesso para Bematech User');
+          if (!success) throw new Error(result.error);
         } else if (this.isNativeMode) {
-          console.log('[PrintBridge] 🔌 Modo OTG Nativo detectado');
-          console.log('[PrintBridge] Verificando status da impressora OTG...');
-          connectionType = 'OTG Android';
-          
-          // Verifica se está conectado antes de enviar
           const status = await nativePrintService.getPrinterStatus();
-          console.log('[PrintBridge] Status retornado:', JSON.stringify(status, null, 2));
-          
-          if (!status.connected) {
-            console.warn('[PrintBridge] ⚠️ Impressora OTG reportada como desconectada');
-            console.warn('[PrintBridge] Tentando reconectar automaticamente...');
-            
-            try {
-              await nativePrintService.connectPrinter();
-              console.log('[PrintBridge] ✅ Reconexão bem-sucedida');
-            } catch (reconnectError) {
-              console.error('[PrintBridge] ❌ Falha na reconexão:', reconnectError);
-              throw new Error("Impressora OTG não está conectada e falhou ao reconectar. Conecte a impressora manualmente.");
-            }
-          } else {
-            console.log('[PrintBridge] ✅ Impressora OTG conectada');
-            console.log('[PrintBridge] Device ID:', status.deviceId);
-            console.log('[PrintBridge] VendorID:', status.vendorId, 'ProductID:', status.productId);
-          }
-          
-          console.log('[PrintBridge] Enviando', bytes.length, 'bytes...');
+          if (!status.connected) await nativePrintService.connectPrinter();
           success = await nativePrintService.sendRawData(bytes);
-          console.log('[PrintBridge] sendRawData retornou:', success);
-          
-          if (success) {
-            console.log('[PrintBridge] ✅ Dados enviados com sucesso via OTG');
-          } else {
-            console.log('[PrintBridge] ❌ Falha ao enviar via OTG');
-          }
         } else {
-          // Tenta WebUSB primeiro, depois rede
           if (webusbPrinter.isConnected()) {
-            console.log('[PrintBridge] 🔌 Enviando para impressora via WebUSB...');
-            connectionType = 'WebUSB';
             await webusbPrinter.print(bytes);
             success = true;
-            console.log('[PrintBridge] ✅ Dados enviados com sucesso via WebUSB');
           } else {
-            // Tenta impressora Wi-Fi se configurada
-            const networkIP = localStorage.getItem('network_printer_ip');
-            const networkPort = localStorage.getItem('network_printer_port');
-            
-            if (networkIP && networkPort) {
-              console.log(`[PrintBridge] 🔌 Enviando para impressora via Wi-Fi (${networkIP}:${networkPort})...`);
-              connectionType = 'Wi-Fi';
-              
-              const networkPrinter = new NetworkPrinter(networkIP, parseInt(networkPort));
-              const connected = await networkPrinter.connect();
-              
-              if (connected) {
-                await networkPrinter.print(bytes);
-                success = true;
-                console.log('[PrintBridge] ✅ Dados enviados com sucesso via Wi-Fi');
-              } else {
-                throw new Error("Não foi possível conectar à impressora Wi-Fi");
-              }
-            } else {
-              throw new Error("Nenhuma impressora conectada (USB ou Wi-Fi)");
-            }
+             // Lógica Wi-Fi...
+             const networkIP = localStorage.getItem('network_printer_ip');
+             const networkPort = localStorage.getItem('network_printer_port');
+             if(networkIP && networkPort) {
+                const networkPrinter = new NetworkPrinter(networkIP, parseInt(networkPort));
+                if(await networkPrinter.connect()) {
+                    await networkPrinter.print(bytes);
+                    success = true;
+                } else throw new Error("Erro Wi-Fi");
+             } else throw new Error("Nenhuma impressora conectada");
           }
         }
 
         if (success) {
-          console.log(`[PrintBridge] ✅ Job ${job.jobId} concluído com sucesso via ${connectionType}`);
-          
-          // Atualiza status para completed
+          console.log(`[PrintBridge] ✅ Job ${job.jobId} concluído!`);
           await this.updateJobStatus(job.jobId, "completed");
           this.onJobStatusChange?.(job.jobId, "completed");
-          
-          // Envia resposta de sucesso
-          await this.sendJobResponse({
-            jobId: job.jobId,
-            status: "OK",
-            timestamp: Date.now(),
-            deviceId: this.deviceId,
-          });
-
-          // Salva log local
-          this.saveJobLog(job, {
-            jobId: job.jobId,
-            status: "OK",
-            timestamp: Date.now(),
-            deviceId: this.deviceId,
-          });
-
-          return; // Sucesso, sai do loop
+          await this.sendJobResponse({ jobId: job.jobId, status: "OK", timestamp: Date.now(), deviceId: this.deviceId });
+          this.saveJobLog(job, { jobId: job.jobId, status: "OK", timestamp: Date.now(), deviceId: this.deviceId });
+          return;
         } else {
-          throw new Error("Falha ao enviar dados para impressora");
+          throw new Error("Falha no envio");
         }
       } catch (error) {
         lastError = error instanceof Error ? error.message : "Erro desconhecido";
         console.error(`[PrintBridge] ❌ Tentativa ${attempt} falhou:`, lastError);
-
-        // Se ainda há tentativas, aguarda antes de tentar novamente
-        if (attempt < maxAttempts) {
-          const delay = 2000 * attempt;
-          console.log(`[PrintBridge] ⏳ Aguardando ${delay}ms antes de tentar novamente...`);
-          await new Promise(resolve => setTimeout(resolve, delay));
-        }
+        if (attempt < maxAttempts) await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
       }
     }
 
-    // Todas as tentativas falharam
-    console.error(`[PrintBridge] Job ${job.jobId} falhou após ${maxAttempts} tentativas`);
-    
-    // Atualiza status para failed
     await this.updateJobStatus(job.jobId, "failed", lastError);
     this.onJobStatusChange?.(job.jobId, "failed", lastError);
-
-    // Envia resposta de erro
-    const errorResponse: PrintJobResponse = {
-      jobId: job.jobId,
-      status: "ERROR",
-      timestamp: Date.now(),
-      deviceId: this.deviceId,
-      error: lastError,
-    };
-
+    const errorResponse: PrintJobResponse = { jobId: job.jobId, status: "ERROR", timestamp: Date.now(), deviceId: this.deviceId, error: lastError };
     await this.sendJobResponse(errorResponse);
     this.saveJobLog(job, errorResponse);
   }
 
-  /**
-   * Atualiza status do job no banco de dados
-   */
-  private async updateJobStatus(
-    jobId: string, 
-    status: "processing" | "completed" | "failed",
-    errorMessage?: string
-  ): Promise<void> {
+  private async updateJobStatus(jobId: string, status: string, errorMessage?: string): Promise<void> {
     try {
-      const { error } = await supabase.rpc("update_job_status", {
-        p_job_id: jobId,
-        p_status: status,
-        p_error_message: errorMessage || null,
-      });
-
-      if (error) {
-        console.error("[PrintBridge] Erro ao atualizar status:", error);
-      }
-    } catch (error) {
-      console.error("[PrintBridge] Erro ao chamar update_job_status:", error);
-    }
+      await supabase.rpc("update_job_status", { p_job_id: jobId, p_status: status, p_error_message: errorMessage || null });
+    } catch (e) { console.error(e); }
   }
 
-  /**
-   * Envia resposta do trabalho para o canal
-   */
   private async sendJobResponse(response: PrintJobResponse): Promise<void> {
-    if (!this.channel || !this.isConnected) {
-      console.warn("[PrintBridge] Canal não conectado, não é possível enviar resposta");
-      return;
-    }
-
+    if (!this.channel || !this.isConnected) return;
     try {
-      await this.channel.send({
-        type: "broadcast",
-        event: "print_job_response",
-        payload: response,
-      });
-      console.log("[PrintBridge] Resposta enviada:", response);
-    } catch (error) {
-      console.error("[PrintBridge] Erro ao enviar resposta:", error);
-    }
+      await this.channel.send({ type: "broadcast", event: "print_job_response", payload: response });
+    } catch (e) { console.error(e); }
   }
 
-  /**
-   * Salva log do trabalho no localStorage
-   */
   private saveJobLog(job: PrintJob, response: PrintJobResponse): void {
     try {
       const logs = JSON.parse(localStorage.getItem("print_bridge_job_logs") || "[]");
-      
-      const logEntry = {
-        jobId: job.jobId,
-        timestamp: response.timestamp,
-        status: response.status,
-        documentType: job.documentType,
-        metadata: job.metadata,
-        error: response.error,
-        deviceId: this.deviceId,
-      };
-
-      logs.unshift(logEntry);
-      
-      // Mantém apenas os últimos 100 logs
-      const trimmedLogs = logs.slice(0, 100);
-      localStorage.setItem("print_bridge_job_logs", JSON.stringify(trimmedLogs));
-    } catch (error) {
-      console.error("[PrintBridge] Erro ao salvar log:", error);
-    }
+      logs.unshift({ jobId: job.jobId, timestamp: response.timestamp, status: response.status, documentType: job.documentType, metadata: job.metadata, error: response.error, deviceId: this.deviceId });
+      localStorage.setItem("print_bridge_job_logs", JSON.stringify(logs.slice(0, 100)));
+    } catch (e) { console.error(e); }
   }
 
-  /**
-   * Tenta reconectar automaticamente com backoff exponencial
-   */
   private async handleReconnect(): Promise<void> {
-    // Verifica se deve manter conexão ativa
-    if (!this.keepAlive) {
-      console.log("[PrintBridge] Keep-alive desativado, não reconecta");
-      return;
-    }
-    
-    // Evita múltiplas tentativas simultâneas
-    if (this.isReconnecting) {
-      console.log("[PrintBridge] Reconexão já em andamento, ignorando...");
-      return;
-    }
-    
+    if (!this.keepAlive || this.isReconnecting) return;
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error("[PrintBridge] ❌ Máximo de tentativas atingido");
       this.onStatusChange?.("disconnected");
       this.isReconnecting = false;
       return;
     }
-
     this.isReconnecting = true;
     this.reconnectAttempts++;
     this.onStatusChange?.("reconnecting");
-    
-    // Backoff exponencial com limite de 10 segundos
     const delay = Math.min(this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1), 10000);
-    console.log(
-      `[PrintBridge] 🔄 Reconectando em ${delay}ms (${this.reconnectAttempts}/${this.maxReconnectAttempts})`
-    );
-
     this.reconnectTimeout = setTimeout(async () => {
       try {
-        // Não chama disconnect completo para não desativar keepAlive
-        if (this.presenceChannel) {
-          await supabase.removeChannel(this.presenceChannel);
-        }
-        if (this.channel) {
-          await supabase.removeChannel(this.channel);
-        }
-        
+        if (this.presenceChannel) await supabase.removeChannel(this.presenceChannel);
+        if (this.channel) await supabase.removeChannel(this.channel);
         await this.connect();
-      } catch (error) {
-        console.error("[PrintBridge] ❌ Erro na reconexão:", error);
+      } catch {
         this.isReconnecting = false;
-        // Tenta novamente se keepAlive ainda estiver ativo
-        if (this.keepAlive && this.reconnectAttempts < this.maxReconnectAttempts) {
-          setTimeout(() => this.handleReconnect(), 2000);
-        }
+        if (this.keepAlive && this.reconnectAttempts < this.maxReconnectAttempts) setTimeout(() => this.handleReconnect(), 2000);
       }
     }, delay);
   }
 
-  /**
-   * Retorna status da conexão
-   */
-  getStatus(): {
-    connected: boolean;
-    deviceId: string;
-    reconnectAttempts: number;
-  } {
-    return {
-      connected: this.isConnected,
-      deviceId: this.deviceId,
-      reconnectAttempts: this.reconnectAttempts,
-    };
-  }
-
-  /**
-   * Obtém logs salvos
-   */
-  static getJobLogs(): any[] {
-    try {
-      return JSON.parse(localStorage.getItem("print_bridge_job_logs") || "[]");
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * Limpa logs
-   */
-  static clearJobLogs(): void {
-    localStorage.removeItem("print_bridge_job_logs");
-  }
+  getStatus() { return { connected: this.isConnected, deviceId: this.deviceId, reconnectAttempts: this.reconnectAttempts }; }
+  static getJobLogs() { try { return JSON.parse(localStorage.getItem("print_bridge_job_logs") || "[]"); } catch { return []; } }
+  static clearJobLogs() { localStorage.removeItem("print_bridge_job_logs"); }
 }
