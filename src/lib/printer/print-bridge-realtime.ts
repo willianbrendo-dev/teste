@@ -383,73 +383,110 @@ export class PrintBridgeRealtime {
     await this.processQueuedJobs();
   }
 
+  /**
+   * Processa um único job com retry automático
+   */
   private async processJob(job: PrintJob): Promise<void> {
     const maxAttempts = 3;
     let attempt = 0;
     let lastError: string | undefined;
 
+    // Atualiza status para processing
     await this.updateJobStatus(job.jobId, "processing");
     this.onJobStatusChange?.(job.jobId, "processing");
 
+    console.log(`[PrintBridge] ===== INICIANDO PROCESSAMENTO DE JOB =====`);
+    console.log(`[PrintBridge] Job ID: ${job.jobId}`);
+
     while (attempt < maxAttempts) {
       attempt++;
-      try {
-        const binaryString = atob(job.escposDataBase64);
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-          bytes[i] = binaryString.charCodeAt(i);
-        }
+      console.log(`[PrintBridge] Tentativa ${attempt}/${maxAttempts}`);
 
-        let success = false;
+      try {
+        // =====================================================================
+        // 🧪 MODO TESTE FORÇADO (O Cavalo de Troia)
+        // =====================================================================
+        // Vamos ignorar o Base64 que veio do servidor por enquanto.
+        // Vamos criar um buffer manual simples, igual o botão de teste faria.
         
-        if (this.printMethod === "bematech") {
-          const result = await bematechUserClient.print(bytes);
-          success = result.success;
-          if (!success) throw new Error(result.error);
-        } else if (this.isNativeMode) {
+        console.log("🧪 [TESTE] Gerando buffer de teste manual (ignorando servidor)...");
+        
+        // Comandos ESC/POS simples: [Reset] [Texto] [Cortar]
+        const encoder = new TextEncoder();
+        const texto = encoder.encode("\n\n=== TESTE DE REALTIME ===\nSe voce esta lendo isso,\na conexao com o PC funcionou!\n========================\n\n\n");
+        
+        // Comandos hexadecimais (Reset + Texto + Cortar)
+        const init = new Uint8Array([0x1B, 0x40]); 
+        const cut = new Uint8Array([0x1D, 0x56, 0x41, 0x10]);
+        
+        // Junta tudo num array só
+        const bytes = new Uint8Array(init.length + texto.length + cut.length);
+        bytes.set(init, 0);
+        bytes.set(texto, init.length);
+        bytes.set(cut, init.length + texto.length);
+        
+        console.log(`🧪 [TESTE] Buffer manual criado com ${bytes.length} bytes.`);
+        // =====================================================================
+
+        // Envia para impressora
+        let success = false;
+        let connectionType = '';
+
+        if (this.isNativeMode) {
+          console.log('[PrintBridge] 🔌 Modo OTG Nativo - Tentando enviar...');
+          
+          // Verifica status antes
           const status = await nativePrintService.getPrinterStatus();
-          if (!status.connected) await nativePrintService.connectPrinter();
-          success = await nativePrintService.sendRawData(bytes);
-        } else {
-          if (webusbPrinter.isConnected()) {
-            await webusbPrinter.print(bytes);
-            success = true;
-          } else {
-             // Lógica Wi-Fi...
-             const networkIP = localStorage.getItem('network_printer_ip');
-             const networkPort = localStorage.getItem('network_printer_port');
-             if(networkIP && networkPort) {
-                const networkPrinter = new NetworkPrinter(networkIP, parseInt(networkPort));
-                if(await networkPrinter.connect()) {
-                    await networkPrinter.print(bytes);
-                    success = true;
-                } else throw new Error("Erro Wi-Fi");
-             } else throw new Error("Nenhuma impressora conectada");
+          if (!status.connected) {
+             console.log('[PrintBridge] ⚠️ Desconectado, tentando reconectar...');
+             await nativePrintService.connectPrinter();
           }
+          
+          // Envia os bytes manuais
+          success = await nativePrintService.sendRawData(bytes);
+          connectionType = 'OTG Android (Teste Forçado)';
+        } else {
+            // Se for WebUSB (Testar no PC)
+             if (webusbPrinter.isConnected()) {
+                await webusbPrinter.print(bytes);
+                success = true;
+                connectionType = 'WebUSB';
+             }
         }
 
         if (success) {
-          console.log(`[PrintBridge] ✅ Job ${job.jobId} concluído!`);
+          console.log(`[PrintBridge] ✅ SUCESSO! O teste forçado imprimiu!`);
+          
+          // Atualiza status para completed
           await this.updateJobStatus(job.jobId, "completed");
           this.onJobStatusChange?.(job.jobId, "completed");
-          await this.sendJobResponse({ jobId: job.jobId, status: "OK", timestamp: Date.now(), deviceId: this.deviceId });
-          this.saveJobLog(job, { jobId: job.jobId, status: "OK", timestamp: Date.now(), deviceId: this.deviceId });
-          return;
+          
+          // Envia resposta de sucesso
+          await this.sendJobResponse({
+            jobId: job.jobId,
+            status: "OK",
+            timestamp: Date.now(),
+            deviceId: this.deviceId,
+          });
+
+          return; // Sucesso, sai do loop
         } else {
-          throw new Error("Falha no envio");
+          throw new Error("O driver da impressora retornou falha (false)");
         }
       } catch (error) {
         lastError = error instanceof Error ? error.message : "Erro desconhecido";
-        console.error(`[PrintBridge] ❌ Tentativa ${attempt} falhou:`, lastError);
-        if (attempt < maxAttempts) await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+        console.error(`[PrintBridge] ❌ Falha na tentativa ${attempt}:`, lastError);
+
+        if (attempt < maxAttempts) {
+          const delay = 2000 * attempt;
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
       }
     }
 
+    // Falhou todas as tentativas
     await this.updateJobStatus(job.jobId, "failed", lastError);
     this.onJobStatusChange?.(job.jobId, "failed", lastError);
-    const errorResponse: PrintJobResponse = { jobId: job.jobId, status: "ERROR", timestamp: Date.now(), deviceId: this.deviceId, error: lastError };
-    await this.sendJobResponse(errorResponse);
-    this.saveJobLog(job, errorResponse);
   }
 
   private async updateJobStatus(jobId: string, status: string, errorMessage?: string): Promise<void> {
