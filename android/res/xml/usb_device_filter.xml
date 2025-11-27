@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Filtro para impressoras USB (classe 7) -->
+    <usb-device class="7" />
+    
+    <!-- Filtros específicos para impressoras térmicas comuns -->
+    <!-- Bematech MP-4200 TH (VendorID: 0x0DD4 = 3540) -->
+    <usb-device vendor-id="3540" />
+    <!-- Bematech (antigo VendorID: 0x0483 = 1155) -->
+    <usb-device vendor-id="1155" />
+    <!-- Epson -->
+    <usb-device vendor-id="1208" />
+    <!-- Star Micronics -->
+    <usb-device vendor-id="1305" />
+    <!-- Custom/Generic thermal printers -->
+    <usb-device vendor-id="1659" />
+    <usb-device vendor-id="1046" />
+    
+    <!-- Permite qualquer dispositivo USB (remova se quiser apenas impressoras) -->
+    <!-- <usb-device /> -->
+</resources>

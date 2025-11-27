@@ -1,0 +1,17 @@
+{
+  "name": "bematech-print-server",
+  "version": "1.0.0",
+  "description": "Servidor local para impressão Bematech via USB",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["bematech", "printer", "escpos"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "serialport": "^12.0.0"
+  }
+}
