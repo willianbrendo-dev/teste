@@ -1,0 +1,19 @@
+project_id = "uisvtoooeutqmklgbkxy"
+
+[functions.create-user]
+verify_jwt = true
+
+[functions.delete-user]
+verify_jwt = true
+
+[functions.send-print-job]
+verify_jwt = true
+
+[functions.network-print-test]
+verify_jwt = false
+
+[functions.network-print]
+verify_jwt = false
+
+[functions.discover-network-printers]
+verify_jwt = false
